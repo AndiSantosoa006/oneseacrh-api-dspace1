@@ -3,226 +3,786 @@
 namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Http\Client\Pool;
 use Inertia\Inertia;
 
 class SearchController extends Controller
 {
-    private string $baseUrl = 'https://repository.ibrahimy.ac.id/rest';
+    private string $baseUrl =
+    'https://repository.ibrahimy.ac.id/rest';
 
     public function index()
     {
         return Inertia::render('Search/Index');
     }
 
-    /**
-     * Mengambil semua collections beserta total itemnya secara paralel
-     */
+    /*
+    |--------------------------------------------------------------------------
+    | COLLECTIONS
+    |--------------------------------------------------------------------------
+    */
+
     public function collections()
     {
         try {
+            $cacheKey = 'repository_collections';
+
+            $cached = Cache::get($cacheKey);
+
+            if ($cached) {
+                return response()->json($cached);
+            }
+
             $response = Http::timeout(30)
-                ->withHeaders(['Accept' => 'application/json'])
-                ->get("{$this->baseUrl}/collections");
+                ->withHeaders([
+                    'Accept' => 'application/json',
+                ])
+                ->get(
+                    "{$this->baseUrl}/collections"
+                );
 
             if (!$response->successful()) {
                 return response()->json([
                     'status' => 'error',
-                    'message' => 'Gagal mengambil collections'
-                ], 500);
+                    'message' =>
+                    'Gagal mengambil collections',
+                ]);
             }
 
             $collections = $response->json();
 
-            // Optimasi N+1: Ambil data total_items secara concurrent (bersamaan)
-            $responses = Http::pool(function (Pool $pool) use ($collections) {
-                foreach ($collections as $collection) {
-                    $pool->withHeaders(['Accept' => 'application/json'])
-                        ->timeout(15)
-                        ->get("{$this->baseUrl}/collections/{$collection['uuid']}/items", [
-                            'limit' => 1,
-                            'offset' => 0,
-                        ]);
+            $responses = Http::pool(
+                function (Pool $pool) use (
+                    $collections
+                ) {
+                    foreach (
+                        $collections
+                        as $collection
+                    ) {
+                        $pool
+                            ->withHeaders([
+                                'Accept' =>
+                                'application/json',
+                            ])
+                            ->timeout(20)
+                            ->get(
+                                "{$this->baseUrl}/collections/{$collection['uuid']}/items",
+                                [
+                                    'limit' => 1,
+                                    'offset' => 0,
+                                ]
+                            );
+                    }
                 }
-            });
+            );
 
-            // Pasangkan kembali hasil jumlah item ke masing-masing koleksi
-            foreach ($collections as $index => &$collection) {
-                $itemResponse = $responses[$index] ?? null;
+            foreach (
+                $collections
+                as $index => &$collection
+            ) {
                 $collection['total_items'] = 0;
 
-                if ($itemResponse && $itemResponse->successful()) {
-                    $items = $itemResponse->json();
-                    $collection['total_items'] = is_array($items) ? count($items) : 0;
+                $itemResponse =
+                    $responses[$index] ?? null;
+
+                if (
+                    $itemResponse &&
+                    $itemResponse->successful()
+                ) {
+                    $items =
+                        $itemResponse->json();
+
+                    $collection['total_items'] =
+                        is_array($items)
+                        ? count($items)
+                        : 0;
                 }
             }
 
-            return response()->json([
+            $result = [
                 'status' => 'success',
-                'results' => $collections
-            ]);
+                'results' => $collections,
+            ];
+
+            Cache::put(
+                $cacheKey,
+                $result,
+                now()->addMinutes(30)
+            );
+
+            return response()->json($result);
         } catch (\Exception $e) {
-            return response()->json([
-                'status' => 'error',
-                'message' => $e->getMessage()
-            ], 500);
+            return response()->json(
+                [
+                    'status' => 'error',
+                    'message' =>
+                    $e->getMessage(),
+                ],
+                500
+            );
         }
     }
 
-    /**
-     * Items berdasarkan collection
-     */
-    public function collectionItems($uuid, Request $request)
-    {
+    /*
+    |--------------------------------------------------------------------------
+    | ITEMS PER COLLECTION
+    |--------------------------------------------------------------------------
+    */
+
+    public function collectionItems(
+        $uuid,
+        Request $request
+    ) {
         try {
-            $keyword = strtolower(trim($request->input('q', '')));
+            $keyword = strtolower(
+                trim($request->input('q', ''))
+            );
+
+            $keywords = array_filter(
+                preg_split('/\s+/', $keyword)
+            );
+
+            $cacheKey =
+                'collection_items_' .
+                $uuid .
+                '_' .
+                md5($keyword);
+
+            $cached = Cache::get($cacheKey);
+
+            if ($cached) {
+                return response()->json($cached);
+            }
+
             $limit = 100;
             $offset = 0;
+
             $allItems = [];
 
-            // Loop pagination DSpace
             do {
                 $response = Http::timeout(60)
-                    ->withHeaders(['Accept' => 'application/json'])
-                    ->get("{$this->baseUrl}/collections/{$uuid}/items", [
-                        'limit' => $limit,
-                        'offset' => $offset,
-                    ]);
+                    ->withHeaders([
+                        'Accept' =>
+                        'application/json',
+                    ])
+                    ->get(
+                        "{$this->baseUrl}/collections/{$uuid}/items",
+                        [
+                            'limit' => $limit,
+                            'offset' => $offset,
+                        ]
+                    );
 
-                if (!$response->successful()) {
-                    return response()->json([
-                        'status' => 'error',
-                        'message' => 'Gagal mengambil items'
-                    ], 500);
+                if (
+                    !$response->successful()
+                ) {
+                    return response()->json(
+                        [
+                            'status' =>
+                            'error',
+                            'message' =>
+                            'Gagal mengambil items',
+                        ],
+                        500
+                    );
                 }
 
                 $items = $response->json();
-                if (!is_array($items) || empty($items)) {
+
+                if (
+                    !is_array($items) ||
+                    empty($items)
+                ) {
                     break;
                 }
 
-                // Optimasi N+1: Ambil semua metadata secara bersamaan untuk page ini
-                $metaResponses = Http::pool(function (Pool $pool) use ($items) {
-                    foreach ($items as $item) {
-                        $itemUuid = $item['uuid'] ?? $item['UUID'] ?? null;
-                        if ($itemUuid) {
-                            $pool->withHeaders(['Accept' => 'application/json'])
-                                ->timeout(15)
-                                ->get("{$this->baseUrl}/items/{$itemUuid}/metadata");
+                /*
+                |--------------------------------------------------------------------------
+                | METADATA PARALLEL
+                |--------------------------------------------------------------------------
+                */
+
+                $metaResponses =
+                    Http::pool(
+                        function (
+                            Pool $pool
+                        ) use ($items) {
+                            foreach (
+                                $items
+                                as $item
+                            ) {
+                                $itemUuid =
+                                    $item['uuid'] ??
+                                    $item['UUID'] ??
+                                    null;
+
+                                if (
+                                    $itemUuid
+                                ) {
+                                    $pool
+                                        ->withHeaders(
+                                            [
+                                                'Accept' =>
+                                                'application/json',
+                                            ]
+                                        )
+                                        ->timeout(
+                                            20
+                                        )
+                                        ->get(
+                                            "{$this->baseUrl}/items/{$itemUuid}/metadata"
+                                        );
+                                }
+                            }
                         }
-                    }
-                });
+                    );
 
-                // Proses hasil metadata dan lakukan filtering
-                foreach ($items as $index => &$item) {
+                foreach (
+                    $items
+                    as $index => &$item
+                ) {
                     $item['abstract'] = '';
-                    $metaResponse = $metaResponses[$index] ?? null;
 
-                    if ($metaResponse && $metaResponse->successful()) {
-                        $metadata = $metaResponse->json();
-                        foreach ($metadata as $meta) {
-                            if (($meta['key'] ?? '') === 'dc.description.abstract') {
-                                $item['abstract'] = strip_tags($meta['value'] ?? '');
+                    $metaResponse =
+                        $metaResponses[$index] ??
+                        null;
+
+                    if (
+                        $metaResponse &&
+                        $metaResponse->successful()
+                    ) {
+                        $metadata =
+                            $metaResponse->json();
+
+                        foreach (
+                            $metadata
+                            as $meta
+                        ) {
+                            if (
+                                ($meta['key'] ??
+                                    '') ===
+                                'dc.description.abstract'
+                            ) {
+                                $item['abstract'] =
+                                    strip_tags(
+                                        $meta['value'] ??
+                                            ''
+                                    );
+
                                 break;
                             }
                         }
                     }
 
-                    // Filter pencarian (Search Client-side/API level)
-                    if (!empty($keyword)) {
-                        $title = strtolower($item['name'] ?? '');
-                        $handle = strtolower($item['handle'] ?? '');
-                        $abstract = strtolower($item['abstract'] ?? '');
+                    /*
+                    |--------------------------------------------------------------------------
+                    | SEARCH TEXT
+                    |--------------------------------------------------------------------------
+                    */
 
-                        if (str_contains($title, $keyword) || str_contains($handle, $keyword) || str_contains($abstract, $keyword)) {
-                            $allItems[] = $item;
+                    $title = strtolower(
+                        $item['name'] ?? ''
+                    );
+
+                    $handle = strtolower(
+                        $item['handle'] ?? ''
+                    );
+
+                    $abstract = strtolower(
+                        $item['abstract'] ?? ''
+                    );
+
+                    $searchText =
+                        $title .
+                        ' ' .
+                        $handle .
+                        ' ' .
+                        $abstract;
+
+                    /*
+                    |--------------------------------------------------------------------------
+                    | MULTI KEYWORD SEARCH
+                    |--------------------------------------------------------------------------
+                    */
+
+                    $matched = true;
+
+                    foreach (
+                        $keywords
+                        as $word
+                    ) {
+                        if (
+                            !str_contains(
+                                $searchText,
+                                $word
+                            )
+                        ) {
+                            $matched = false;
+                            break;
                         }
-                    } else {
+                    }
+
+                    if (
+                        empty($keywords)
+                    ) {
+                        $allItems[] = $item;
+                    } elseif ($matched) {
                         $allItems[] = $item;
                     }
                 }
 
                 $count = count($items);
+
                 $offset += $limit;
             } while ($count === $limit);
 
-            return response()->json([
+            $result = [
                 'status' => 'success',
-                'total_items' => count($allItems),
-                'results' => array_values($allItems)
-            ]);
+                'total_items' => count(
+                    $allItems
+                ),
+                'results' => array_values(
+                    $allItems
+                ),
+            ];
+
+            Cache::put(
+                $cacheKey,
+                $result,
+                now()->addMinutes(20)
+            );
+
+            return response()->json($result);
         } catch (\Exception $e) {
-            return response()->json([
-                'status' => 'error',
-                'message' => $e->getMessage()
-            ], 500);
+            return response()->json(
+                [
+                    'status' => 'error',
+                    'message' =>
+                    $e->getMessage(),
+                ],
+                500
+            );
         }
     }
 
-    /**
-     * Menghitung jumlah item per koleksi berdasarkan keyword
-     */
-    public function collectionCounts(Request $request)
-    {
+    /*
+    |--------------------------------------------------------------------------
+    | COLLECTION COUNTS
+    |--------------------------------------------------------------------------
+    */
+
+    public function collectionCounts(
+        Request $request
+    ) {
         try {
-            $keyword = strtolower(trim($request->input('q', '')));
+            $keyword = strtolower(
+                trim($request->input('q', ''))
+            );
 
-            $collectionsResponse = Http::timeout(30)
-                ->withHeaders(['Accept' => 'application/json'])
-                ->get("{$this->baseUrl}/collections");
+            $keywords = array_filter(
+                preg_split('/\s+/', $keyword)
+            );
 
-            if (!$collectionsResponse->successful()) {
-                return response()->json([
-                    'status' => 'error',
-                    'message' => 'Gagal mengambil collections'
-                ], 500);
+            $cacheKey =
+                'collection_counts_' .
+                md5($keyword);
+
+            $cached = Cache::get($cacheKey);
+
+            if ($cached) {
+                return response()->json($cached);
             }
 
-            $collections = $collectionsResponse->json();
+            $collectionsResponse =
+                Http::timeout(30)
+                ->withHeaders([
+                    'Accept' =>
+                    'application/json',
+                ])
+                ->get(
+                    "{$this->baseUrl}/collections"
+                );
+
+            if (
+                !$collectionsResponse->successful()
+            ) {
+                return response()->json(
+                    [
+                        'status' =>
+                        'error',
+                        'message' =>
+                        'Gagal mengambil collections',
+                    ]
+                );
+            }
+
+            $collections =
+                $collectionsResponse->json();
+
+            $responses = Http::pool(
+                function (Pool $pool) use (
+                    $collections
+                ) {
+                    foreach (
+                        $collections
+                        as $collection
+                    ) {
+                        $pool
+                            ->withHeaders([
+                                'Accept' =>
+                                'application/json',
+                            ])
+                            ->timeout(30)
+                            ->get(
+                                "{$this->baseUrl}/collections/{$collection['uuid']}/items",
+                                [
+                                    'limit' => 100,
+                                    'offset' => 0,
+                                ]
+                            );
+                    }
+                }
+            );
+
             $results = [];
 
-            // Optimasi N+1: Ambil data items dari semua koleksi sekaligus
-            $responses = Http::pool(function (Pool $pool) use ($collections) {
-                foreach ($collections as $collection) {
-                    $pool->withHeaders(['Accept' => 'application/json'])
-                        ->timeout(30)
-                        ->get("{$this->baseUrl}/collections/{$collection['uuid']}/items", [
-                            'limit' => 100,
-                            'offset' => 0,
-                        ]);
-                }
-            });
+            foreach (
+                $collections
+                as $index => $collection
+            ) {
+                $itemsResponse =
+                    $responses[$index] ?? null;
 
-            foreach ($collections as $index => $collection) {
-                $itemsResponse = $responses[$index] ?? null;
-                $items = ($itemsResponse && $itemsResponse->successful()) ? $itemsResponse->json() : [];
+                $items =
+                    $itemsResponse &&
+                    $itemsResponse->successful()
+                    ? $itemsResponse->json()
+                    : [];
 
                 if (!is_array($items)) {
                     $items = [];
                 }
 
-                if (!empty($keyword)) {
-                    $items = array_filter($items, function ($item) use ($keyword) {
-                        return str_contains(strtolower($item['name'] ?? ''), $keyword);
-                    });
+                if (!empty($keywords)) {
+                    $items = array_filter(
+                        $items,
+                        function (
+                            $item
+                        ) use (
+                            $keywords
+                        ) {
+                            $title = strtolower(
+                                $item['name'] ?? ''
+                            );
+
+                            foreach (
+                                $keywords
+                                as $word
+                            ) {
+                                if (
+                                    !str_contains(
+                                        $title,
+                                        $word
+                                    )
+                                ) {
+                                    return false;
+                                }
+                            }
+
+                            return true;
+                        }
+                    );
                 }
 
                 $results[] = [
-                    'uuid' => $collection['uuid'],
-                    'total_items' => count($items)
+                    'uuid' =>
+                    $collection['uuid'],
+                    'total_items' => count(
+                        $items
+                    ),
                 ];
             }
 
-            return response()->json([
+            $result = [
                 'status' => 'success',
-                'results' => $results
-            ]);
+                'results' => $results,
+            ];
+
+            Cache::put(
+                $cacheKey,
+                $result,
+                now()->addMinutes(10)
+            );
+
+            return response()->json($result);
         } catch (\Exception $e) {
-            return response()->json([
-                'status' => 'error',
-                'message' => $e->getMessage()
-            ], 500);
+            return response()->json(
+                [
+                    'status' => 'error',
+                    'message' =>
+                    $e->getMessage(),
+                ],
+                500
+            );
+        }
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | GLOBAL SEARCH
+    |--------------------------------------------------------------------------
+    */
+
+    public function globalSearch(
+        Request $request
+    ) {
+        try {
+            $keyword = strtolower(
+                trim($request->input('q', ''))
+            );
+
+            $keywords = array_filter(
+                preg_split('/\s+/', $keyword)
+            );
+
+            $cacheKey =
+                'global_search_' .
+                md5($keyword);
+
+            $cached = Cache::get($cacheKey);
+
+            if ($cached) {
+                return response()->json($cached);
+            }
+
+            $collectionsResponse =
+                Http::timeout(30)
+                ->withHeaders([
+                    'Accept' =>
+                    'application/json',
+                ])
+                ->get(
+                    "{$this->baseUrl}/collections"
+                );
+
+            if (
+                !$collectionsResponse->successful()
+            ) {
+                return response()->json(
+                    [
+                        'status' =>
+                        'error',
+                        'message' =>
+                        'Gagal mengambil collections',
+                    ]
+                );
+            }
+
+            $collections =
+                $collectionsResponse->json();
+
+            $responses = Http::pool(
+                function (Pool $pool) use (
+                    $collections
+                ) {
+                    foreach (
+                        $collections
+                        as $collection
+                    ) {
+                        $pool
+                            ->withHeaders([
+                                'Accept' =>
+                                'application/json',
+                            ])
+                            ->timeout(60)
+                            ->get(
+                                "{$this->baseUrl}/collections/{$collection['uuid']}/items",
+                                [
+                                    'limit' => 100,
+                                    'offset' => 0,
+                                ]
+                            );
+                    }
+                }
+            );
+
+            $allItems = [];
+
+            foreach (
+                $collections
+                as $index => $collection
+            ) {
+                $itemsResponse =
+                    $responses[$index] ?? null;
+
+                $items =
+                    $itemsResponse &&
+                    $itemsResponse->successful()
+                    ? $itemsResponse->json()
+                    : [];
+
+                if (!is_array($items)) {
+                    continue;
+                }
+
+                $metaResponses =
+                    Http::pool(
+                        function (
+                            Pool $pool
+                        ) use ($items) {
+                            foreach (
+                                $items
+                                as $item
+                            ) {
+                                $itemUuid =
+                                    $item['uuid'] ??
+                                    $item['UUID'] ??
+                                    null;
+
+                                if (
+                                    $itemUuid
+                                ) {
+                                    $pool
+                                        ->withHeaders(
+                                            [
+                                                'Accept' =>
+                                                'application/json',
+                                            ]
+                                        )
+                                        ->timeout(
+                                            20
+                                        )
+                                        ->get(
+                                            "{$this->baseUrl}/items/{$itemUuid}/metadata"
+                                        );
+                                }
+                            }
+                        }
+                    );
+
+                foreach (
+                    $items
+                    as $itemIndex => &$item
+                ) {
+                    $item['abstract'] = '';
+
+                    $metaResponse =
+                        $metaResponses[$itemIndex] ??
+                        null;
+
+                    if (
+                        $metaResponse &&
+                        $metaResponse->successful()
+                    ) {
+                        $metadata =
+                            $metaResponse->json();
+
+                        foreach (
+                            $metadata
+                            as $meta
+                        ) {
+                            if (
+                                ($meta['key'] ??
+                                    '') ===
+                                'dc.description.abstract'
+                            ) {
+                                $item['abstract'] =
+                                    strip_tags(
+                                        $meta['value'] ??
+                                            ''
+                                    );
+
+                                break;
+                            }
+                        }
+                    }
+
+                    $title = strtolower(
+                        $item['name'] ?? ''
+                    );
+
+                    $handle = strtolower(
+                        $item['handle'] ?? ''
+                    );
+
+                    $abstract = strtolower(
+                        $item['abstract'] ?? ''
+                    );
+
+                    $searchText =
+                        $title .
+                        ' ' .
+                        $handle .
+                        ' ' .
+                        $abstract;
+
+                    $matched = true;
+
+                    foreach (
+                        $keywords
+                        as $word
+                    ) {
+                        if (
+                            !str_contains(
+                                $searchText,
+                                $word
+                            )
+                        ) {
+                            $matched = false;
+                            break;
+                        }
+                    }
+
+                    if (
+                        empty($keywords)
+                    ) {
+                        $allItems[] = [
+                            ...$item,
+                            'collection_name' =>
+                            $collection['name'],
+                            'collection_uuid' =>
+                            $collection['uuid'],
+                        ];
+                    } elseif ($matched) {
+                        $allItems[] = [
+                            ...$item,
+                            'collection_name' =>
+                            $collection['name'],
+                            'collection_uuid' =>
+                            $collection['uuid'],
+                        ];
+                    }
+                }
+            }
+
+            $result = [
+                'status' => 'success',
+                'total_items' => count(
+                    $allItems
+                ),
+                'results' => array_values(
+                    $allItems
+                ),
+            ];
+
+            Cache::put(
+                $cacheKey,
+                $result,
+                now()->addMinutes(20)
+            );
+
+            return response()->json($result);
+        } catch (\Exception $e) {
+            return response()->json(
+                [
+                    'status' => 'error',
+                    'message' =>
+                    $e->getMessage(),
+                ],
+                500
+            );
         }
     }
 }

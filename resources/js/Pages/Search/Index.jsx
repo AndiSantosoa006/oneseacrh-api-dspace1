@@ -3,176 +3,131 @@ import axios from 'axios';
 import { Head } from '@inertiajs/react';
 
 export default function Index() {
-    /**
-     * STATE
-     */
     const [collections, setCollections] = useState([]);
-    const [activeCollection, setActiveCollection] = useState(null);
-    const [items, setItems] = useState([]);
+    const [activeCollection, setActiveCollection] = useState('all');
+    const [allItems, setAllItems] = useState([]);
     const [query, setQuery] = useState('');
-
-    const [loadingCollections, setLoadingCollections] =
-        useState(false);
-
-    const [loadingItems, setLoadingItems] =
-        useState(false);
-
-    const [loadingCounts, setLoadingCounts] =
-        useState(false);
-
+    const [loadingCollections, setLoadingCollections] = useState(false);
+    const [loadingItems, setLoadingItems] = useState(false);
+    const [loadingCounts, setLoadingCounts] = useState(false);
     const [error, setError] = useState('');
-
-    /**
-     * PAGINATION
-     */
     const [currentPage, setCurrentPage] = useState(1);
 
     const ITEMS_PER_PAGE = 10;
 
-    /**
-     * LOAD COLLECTIONS
-     */
     useEffect(() => {
         fetchCollections();
     }, []);
 
-    /**
-     * UPDATE COUNTS
-     */
     useEffect(() => {
         if (!collections.length) return;
 
         const debounce = setTimeout(() => {
             updateCollectionCounts(query);
+            fetchAllItems(query);
         }, 400);
 
         return () => clearTimeout(debounce);
-    }, [query]);
+    }, [query, collections.length]);
 
-    /**
-     * FETCH ITEMS
-     */
-    useEffect(() => {
-        if (!activeCollection) return;
-
-        const debounce = setTimeout(() => {
-            fetchItems(activeCollection);
-        }, 400);
-
-        return () => clearTimeout(debounce);
-    }, [activeCollection, query]);
-
-    /**
-     * RESET PAGE
-     */
     useEffect(() => {
         setCurrentPage(1);
     }, [query, activeCollection]);
 
-    /**
-     * FETCH COLLECTIONS
-     */
+    const keywords = useMemo(() => {
+        return query.trim().split(/\s+/).filter(Boolean);
+    }, [query]);
+
     const fetchCollections = async () => {
         setLoadingCollections(true);
         setError('');
 
         try {
-            const { data } = await axios.get(
-                '/api/collections'
-            );
+            const { data } = await axios.get('/api/collections');
 
             if (data.status === 'success') {
-                const formattedCollections = (
-                    data.results || []
-                ).map((collection) => ({
+                const formatted = data.results.map((collection) => ({
                     ...collection,
-                    search_total: 0,
+                    search_total: collection.total_items || 0,
                 }));
 
-                setCollections(formattedCollections);
+                setCollections(formatted);
 
-                if (formattedCollections.length > 0) {
-                    setActiveCollection(
-                        formattedCollections[0].uuid
-                    );
-                }
+                fetchAllItems('');
             }
         } catch (err) {
             console.error(err);
-            setError(
-                'Gagal mengambil data collections.'
-            );
+            setError('Gagal mengambil collections.');
         } finally {
             setLoadingCollections(false);
         }
     };
 
-    /**
-     * FETCH ITEMS
-     */
-    const fetchItems = async (collectionUuid) => {
+    const fetchAllItems = async (keyword = '') => {
         setLoadingItems(true);
         setError('');
 
         try {
-            const { data } = await axios.get(
-                `/api/collections/${collectionUuid}/items`,
-                {
-                    params: {
-                        q: query,
-                    },
-                }
+            let visibleCollections = collections;
+
+            if (keyword.trim()) {
+                visibleCollections = collections.filter(
+                    (collection) => collection.search_total > 0
+                );
+            }
+
+            const requests = visibleCollections.map((collection) =>
+                axios.get(`/api/collections/${collection.uuid}/items`, {
+                    params: { q: keyword },
+                })
             );
 
-            if (data.status === 'success') {
-                setItems(data.results || []);
-            } else {
-                setItems([]);
-            }
+            const responses = await Promise.all(requests);
+
+            let mergedItems = [];
+
+            responses.forEach((response, index) => {
+                const collection = visibleCollections[index];
+                const results = response.data.results || [];
+
+                const mapped = results.map((item) => ({
+                    ...item,
+                    collection_name: collection.name,
+                    collection_uuid: collection.uuid,
+                }));
+
+                mergedItems.push(...mapped);
+            });
+
+            setAllItems(mergedItems);
         } catch (err) {
             console.error(err);
-            setItems([]);
-            setError(
-                'Gagal mengambil data repository.'
-            );
+            setError('Gagal mengambil repository.');
         } finally {
             setLoadingItems(false);
         }
     };
 
-    /**
-     * UPDATE COUNTS
-     */
-    const updateCollectionCounts = async (
-        keyword = ''
-    ) => {
+    const updateCollectionCounts = async (keyword = '') => {
         setLoadingCounts(true);
 
         try {
-            const { data } = await axios.get(
-                '/api/collections-counts',
-                {
-                    params: {
-                        q: keyword,
-                    },
-                }
-            );
+            const { data } = await axios.get('/api/collections-counts', {
+                params: { q: keyword },
+            });
 
             if (data.status === 'success') {
                 const counts = data.results || [];
 
-                setCollections((prevCollections) =>
-                    prevCollections.map((collection) => {
+                setCollections((prev) =>
+                    prev.map((collection) => {
                         const found = counts.find(
-                            (count) =>
-                                count.uuid ===
-                                collection.uuid
+                            (count) => count.uuid === collection.uuid
                         );
 
                         return {
                             ...collection,
-                            search_total:
-                                found?.total_items || 0,
+                            search_total: found?.total_items || 0,
                         };
                     })
                 );
@@ -184,128 +139,150 @@ export default function Index() {
         }
     };
 
-    /**
-     * HIGHLIGHT TEXT
-     */
-    const highlightText = (text, keyword) => {
-        if (!keyword || !text) return text;
+    const highlightText = (text = '') => {
+        if (!query.trim()) return text;
 
-        const escapedKeyword = keyword.replace(
-            /[.*+?^${}()|[\]\\]/g,
-            '\\$&'
-        );
+        let highlighted = text;
 
-        const regex = new RegExp(
-            `(${escapedKeyword})`,
-            'gi'
-        );
+        keywords.forEach((word) => {
+            const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-        return text.split(regex).map((part, index) =>
-            regex.test(part) ? (
-                <mark
-                    key={index}
-                    className="
-                        bg-yellow-200
-                        text-slate-900
-                        rounded
-                        px-1
-                    "
-                >
-                    {part}
-                </mark>
-            ) : (
-                part
-            )
-        );
+            const regex = new RegExp(`(${escaped})`, 'gi');
+
+            highlighted = highlighted.replace(
+                regex,
+                '|||HIGHLIGHT|||$1|||END|||'
+            );
+        });
+
+        return highlighted
+            .split(/(\|\|\|HIGHLIGHT\|\|\|.*?\|\|\|END\|\|\|)/g)
+            .map((part, index) => {
+                if (part.startsWith('|||HIGHLIGHT|||')) {
+                    const clean = part
+                        .replace('|||HIGHLIGHT|||', '')
+                        .replace('|||END|||', '');
+
+                    return (
+                        <mark
+                            key={index}
+                            className="rounded bg-yellow-200 px-1 text-slate-900"
+                        >
+                            {clean}
+                        </mark>
+                    );
+                }
+
+                return part;
+            });
     };
 
-    /**
-     * ABSTRACT SNIPPET
-     */
-    const getAbstractSnippet = (
-        abstract,
-        keyword,
-        maxLength = 180
-    ) => {
-        if (!abstract) return '';
-
-        if (!keyword) {
+    const getAbstractSnippet = (abstract = '', maxLength = 220) => {
+        if (!query.trim()) {
             return abstract.length > maxLength
-                ? `${abstract.substring(
-                      0,
-                      maxLength
-                  )}...`
+                ? `${abstract.substring(0, maxLength)}...`
                 : abstract;
         }
 
-        const lowerAbstract =
-            abstract.toLowerCase();
+        const lower = abstract.toLowerCase();
 
-        const lowerKeyword =
-            keyword.toLowerCase();
+        let firstIndex = -1;
 
-        const keywordIndex =
-            lowerAbstract.indexOf(lowerKeyword);
+        keywords.forEach((word) => {
+            const index = lower.indexOf(word.toLowerCase());
 
-        if (keywordIndex === -1) {
+            if (index !== -1 && (firstIndex === -1 || index < firstIndex)) {
+                firstIndex = index;
+            }
+        });
+
+        if (firstIndex === -1) {
             return abstract.length > maxLength
-                ? `${abstract.substring(
-                      0,
-                      maxLength
-                  )}...`
+                ? `${abstract.substring(0, maxLength)}...`
                 : abstract;
         }
 
-        const start = Math.max(
-            keywordIndex - 70,
-            0
-        );
+        const start = Math.max(firstIndex - 80, 0);
+        const end = Math.min(firstIndex + 140, abstract.length);
 
-        const end = Math.min(
-            keywordIndex + 120,
-            abstract.length
-        );
+        let snippet = abstract.substring(start, end);
 
-        let snippet = abstract.substring(
-            start,
-            end
-        );
-
-        if (start > 0) {
-            snippet = `...${snippet}`;
-        }
-
-        if (end < abstract.length) {
-            snippet = `${snippet}...`;
-        }
+        if (start > 0) snippet = `...${snippet}`;
+        if (end < abstract.length) snippet = `${snippet}...`;
 
         return snippet;
     };
 
-    /**
-     * PAGINATION
-     */
-    const totalPages = Math.ceil(
-        items.length / ITEMS_PER_PAGE
-    );
+    const filteredItems = useMemo(() => {
+        if (activeCollection === 'all') return allItems;
+
+        return allItems.filter(
+            (item) => item.collection_uuid === activeCollection
+        );
+    }, [allItems, activeCollection]);
+
+    const totalPages = Math.ceil(filteredItems.length / ITEMS_PER_PAGE);
 
     const paginatedItems = useMemo(() => {
-        const start =
-            (currentPage - 1) * ITEMS_PER_PAGE;
-
+        const start = (currentPage - 1) * ITEMS_PER_PAGE;
         const end = start + ITEMS_PER_PAGE;
 
-        return items.slice(start, end);
-    }, [items, currentPage]);
+        return filteredItems.slice(start, end);
+    }, [filteredItems, currentPage]);
+
+    const groupedItems = useMemo(() => {
+        const grouped = {};
+
+        allItems.forEach((item) => {
+            if (!grouped[item.collection_name]) {
+                grouped[item.collection_name] = [];
+            }
+
+            grouped[item.collection_name].push(item);
+        });
+
+        return grouped;
+    }, [allItems]);
+
+    const renderCard = (item) => (
+        <div
+            key={item.uuid || item.UUID}
+            className="rounded-2xl border border-slate-200 bg-white p-5 transition hover:border-blue-200"
+        >
+            <h2 className="text-sm font-semibold leading-6 text-slate-800">
+                {highlightText(item.name)}
+            </h2>
+
+            {item.abstract && (
+                <p className="mt-2 text-sm leading-6 text-slate-500">
+                    {highlightText(getAbstractSnippet(item.abstract))}
+                </p>
+            )}
+
+            <div className="mt-4 flex items-center justify-between border-t border-slate-100 pt-3">
+                <span className="truncate text-xs text-slate-400">
+                    {item.handle}
+                </span>
+
+                <a
+                    href={`https://repository.ibrahimy.ac.id/handle/${item.handle}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="rounded-lg border border-slate-200 px-3 py-2 text-xs text-slate-600 transition hover:border-blue-500 hover:text-blue-600"
+                >
+                    Detail
+                </a>
+            </div>
+        </div>
+    );
 
     return (
-        <div className="min-h-screen bg-slate-100">
+        <div className="min-h-screen bg-slate-50">
             <Head title="OneSearch" />
 
             <div className="mx-auto max-w-5xl px-4 py-8">
-                {/* HEADER */}
                 <div className="mb-8">
-                    <h1 className="text-2xl font-semibold text-slate-800">
+                    <h1 className="text-xl font-semibold text-slate-800">
                         OneSearch
                     </h1>
 
@@ -314,374 +291,174 @@ export default function Index() {
                     </p>
                 </div>
 
-                {/* SEARCH */}
                 <div className="mb-6">
                     <input
                         type="text"
                         placeholder="Cari repository..."
                         value={query}
-                        onChange={(e) =>
-                            setQuery(e.target.value)
-                        }
-                        className="
-                            w-full
-                            rounded-xl
-                            border
-                            border-slate-200
-                            bg-white
-                            px-4
-                            py-3
-                            text-sm
-                            text-slate-700
-                            outline-none
-                            transition
-                            focus:border-blue-500
-                        "
+                        onChange={(e) => setQuery(e.target.value)}
+                        className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-700 outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
                     />
                 </div>
 
-                {/* COLLECTIONS */}
-                <div className="mb-6 overflow-x-auto">
-                    {loadingCollections ? (
-                        <div className="text-sm text-slate-500">
-                            Loading...
-                        </div>
-                    ) : (
-                        <div className="flex gap-2">
-                            {collections
-    .filter(
-        (collection) => collection.search_total > 0
-    )
-    .map((collection) => {
-                                    const isActive =
-                                        activeCollection ===
-                                        collection.uuid;
+                <div className="mb-8 overflow-x-auto">
+                    <div className="flex gap-2">
+                        <button
+                            onClick={() => setActiveCollection('all')}
+                            className={`rounded-xl border px-4 py-2 text-xs font-medium transition ${
+                                activeCollection === 'all'
+                                    ? 'border-blue-600 bg-blue-600 text-white'
+                                    : 'border-slate-200 bg-white text-slate-600'
+                            }`}
+                        >
+                            Semua
+                        </button>
 
-                                    return (
-                                        <button
-                                            key={
-                                                collection.uuid
-                                            }
-                                            onClick={() =>
-                                                setActiveCollection(
-                                                    collection.uuid
-                                                )
-                                            }
-                                            className={`
-                                                flex
-                                                items-center
-                                                gap-2
-                                                whitespace-nowrap
-                                                rounded-xl
-                                                border
-                                                px-3
-                                                py-2
-                                                text-xs
-                                                font-medium
-                                                transition
-                                                ${
-                                                    isActive
-                                                        ? 'border-blue-600 bg-blue-600 text-white'
-                                                        : 'border-slate-200 bg-white text-slate-600 hover:border-blue-300'
-                                                }
-                                            `}
-                                        >
-                                            <span>
-                                                {
-                                                    collection.name
-                                                }
-                                            </span>
+                        {collections
+                            .filter((collection) =>
+                                query.trim()
+                                    ? collection.search_total > 0
+                                    : collection.total_items > 0
+                            )
+                            .map((collection) => {
+                                const isActive =
+                                    activeCollection === collection.uuid;
 
-                                            <span
-                                                className="
-                                                    rounded-full
-                                                    bg-black/10
-                                                    px-2
-                                                    py-0.5
-                                                    text-[10px]
-                                                "
-                                            >
-                                                {loadingCounts
-                                                    ? '...'
-                                                    : collection.search_total}
-                                            </span>
-                                        </button>
-                                    );
-                                }
-                            )}
-                        </div>
-                    )}
+                                return (
+                                    <button
+                                        key={collection.uuid}
+                                        onClick={() =>
+                                            setActiveCollection(collection.uuid)
+                                        }
+                                        className={`flex items-center gap-2 whitespace-nowrap rounded-xl border px-4 py-2 text-xs font-medium transition ${
+                                            isActive
+                                                ? 'border-blue-600 bg-blue-600 text-white'
+                                                : 'border-slate-200 bg-white text-slate-600'
+                                        }`}
+                                    >
+                                        <span>{collection.name}</span>
+
+                                        <span className="rounded-full bg-black/10 px-2 py-0.5 text-[10px]">
+                                            {loadingCounts
+                                                ? '...'
+                                                : query.trim()
+                                                ? collection.search_total
+                                                : collection.total_items}
+                                        </span>
+                                    </button>
+                                );
+                            })}
+                    </div>
                 </div>
 
-                {/* ERROR */}
                 {error && (
-                    <div
-                        className="
-                            mb-5
-                            rounded-xl
-                            border
-                            border-red-200
-                            bg-red-50
-                            px-4
-                            py-3
-                            text-sm
-                            text-red-600
-                        "
-                    >
+                    <div className="mb-6 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-600">
                         {error}
                     </div>
                 )}
 
-                {/* LOADING */}
                 {loadingItems && (
-                    <div className="py-12 text-center">
-                        <div
-                            className="
-                                mx-auto
-                                h-7
-                                w-7
-                                animate-spin
-                                rounded-full
-                                border-2
-                                border-blue-600
-                                border-t-transparent
-                            "
-                        />
+                    <div className="py-14 text-center">
+                        <div className="mx-auto h-7 w-7 animate-spin rounded-full border-2 border-blue-600 border-t-transparent" />
 
-                        <p className="mt-3 text-sm text-slate-500">
+                        <p className="mt-4 text-sm text-slate-500">
                             Memuat repository...
                         </p>
                     </div>
                 )}
 
-                {/* EMPTY */}
-                {!loadingItems &&
-                    paginatedItems.length === 0 && (
-                        <div
-                            className="
-                                rounded-2xl
-                                border
-                                border-slate-200
-                                bg-white
-                                px-6
-                                py-10
-                                text-center
-                            "
-                        >
-                            <h2 className="text-sm font-medium text-slate-700">
-                                Tidak ada hasil ditemukan
-                            </h2>
-                        </div>
-                    )}
+                {!loadingItems && filteredItems.length === 0 && (
+                    <div className="rounded-2xl border border-slate-200 bg-white px-6 py-10 text-center">
+                        <p className="text-sm text-slate-500">
+                            Tidak ada hasil ditemukan
+                        </p>
+                    </div>
+                )}
 
-                {/* ITEMS */}
-                {!loadingItems &&
-                    paginatedItems.length > 0 && (
-                        <>
-                            <div className="space-y-3">
-                                {paginatedItems.map(
-                                    (item) => (
-                                        <div
-                                            key={
-                                                item.uuid ||
-                                                item.UUID
-                                            }
-                                            className="
-                                                rounded-2xl
-                                                border
-                                                border-slate-200
-                                                bg-white
-                                                p-5
-                                                transition
-                                                hover:border-blue-200
-                                            "
-                                        >
-                                            {/* TITLE */}
-                                            <h2
-                                                className="
-                                                    text-sm
-                                                    font-semibold
-                                                    leading-6
-                                                    text-slate-800
-                                                "
-                                            >
-                                                {highlightText(
-                                                    item.name,
-                                                    query
-                                                )}
-                                            </h2>
+                {!loadingItems && filteredItems.length > 0 && (
+                    <>
+                        {activeCollection === 'all' ? (
+                            <div className="space-y-8">
+                                {Object.entries(groupedItems).map(
+                                    ([collectionName, collectionItems]) => (
+                                        <div key={collectionName}>
+                                            <div className="mb-4 flex items-center justify-between">
+                                                <h2 className="text-sm font-semibold text-slate-700">
+                                                    {collectionName}
+                                                </h2>
 
-                                            {/* ABSTRACT */}
-                                            {item.abstract && (
-                                                <p
-                                                    className="
-                                                        mt-2
-                                                        text-sm
-                                                        leading-6
-                                                        text-slate-500
-                                                    "
-                                                >
-                                                    {highlightText(
-                                                        getAbstractSnippet(
-                                                            item.abstract,
-                                                            query
-                                                        ),
-                                                        query
-                                                    )}
-                                                </p>
-                                            )}
-
-                                            {/* FOOTER */}
-                                            <div
-                                                className="
-                                                    mt-4
-                                                    flex
-                                                    items-center
-                                                    justify-between
-                                                    gap-3
-                                                    border-t
-                                                    border-slate-100
-                                                    pt-3
-                                                "
-                                            >
-                                                <span
-                                                    className="
-                                                        truncate
-                                                        text-xs
-                                                        text-slate-400
-                                                    "
-                                                >
-                                                    {
-                                                        item.handle
-                                                    }
+                                                <span className="text-xs text-slate-400">
+                                                    {collectionItems.length}{' '}
+                                                    items
                                                 </span>
+                                            </div>
 
-                                                <a
-                                                    href={`https://repository.ibrahimy.ac.id/handle/${item.handle}`}
-                                                    target="_blank"
-                                                    rel="noreferrer"
-                                                    className="
-                                                        rounded-lg
-                                                        border
-                                                        border-slate-200
-                                                        px-3
-                                                        py-2
-                                                        text-xs
-                                                        font-medium
-                                                        text-slate-700
-                                                        transition
-                                                        hover:border-blue-500
-                                                        hover:text-blue-600
-                                                    "
-                                                >
-                                                    Detail
-                                                </a>
+                                            <div className="space-y-3">
+                                                {collectionItems.map(
+                                                    renderCard
+                                                )}
                                             </div>
                                         </div>
                                     )
                                 )}
                             </div>
-
-                            {/* PAGINATION */}
-                            {totalPages > 1 && (
-                                <div
-                                    className="
-                                        mt-8
-                                        flex
-                                        items-center
-                                        justify-center
-                                        gap-2
-                                    "
-                                >
-                                    <button
-                                        disabled={
-                                            currentPage === 1
-                                        }
-                                        onClick={() =>
-                                            setCurrentPage(
-                                                (prev) =>
-                                                    prev - 1
-                                            )
-                                        }
-                                        className="
-                                            rounded-lg
-                                            border
-                                            border-slate-200
-                                            bg-white
-                                            px-3
-                                            py-2
-                                            text-xs
-                                            text-slate-600
-                                            disabled:opacity-50
-                                        "
-                                    >
-                                        Prev
-                                    </button>
-
-                                    {[
-                                        ...Array(
-                                            totalPages
-                                        ),
-                                    ].map((_, index) => {
-                                        const page =
-                                            index + 1;
-
-                                        return (
-                                            <button
-                                                key={page}
-                                                onClick={() =>
-                                                    setCurrentPage(
-                                                        page
-                                                    )
-                                                }
-                                                className={`
-                                                    rounded-lg
-                                                    px-3
-                                                    py-2
-                                                    text-xs
-                                                    transition
-                                                    ${
-                                                        currentPage ===
-                                                        page
-                                                            ? 'bg-blue-600 text-white'
-                                                            : 'border border-slate-200 bg-white text-slate-600'
-                                                    }
-                                                `}
-                                            >
-                                                {page}
-                                            </button>
-                                        );
-                                    })}
-
-                                    <button
-                                        disabled={
-                                            currentPage ===
-                                            totalPages
-                                        }
-                                        onClick={() =>
-                                            setCurrentPage(
-                                                (prev) =>
-                                                    prev + 1
-                                            )
-                                        }
-                                        className="
-                                            rounded-lg
-                                            border
-                                            border-slate-200
-                                            bg-white
-                                            px-3
-                                            py-2
-                                            text-xs
-                                            text-slate-600
-                                            disabled:opacity-50
-                                        "
-                                    >
-                                        Next
-                                    </button>
+                        ) : (
+                            <>
+                                <div className="space-y-3">
+                                    {paginatedItems.map(renderCard)}
                                 </div>
-                            )}
-                        </>
-                    )}
+
+                                {totalPages > 1 && (
+                                    <div className="mt-8 flex items-center justify-center gap-2">
+                                        <button
+                                            disabled={currentPage === 1}
+                                            onClick={() =>
+                                                setCurrentPage((prev) => prev - 1)
+                                            }
+                                            className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-xs text-slate-600 transition disabled:opacity-50"
+                                        >
+                                            Prev
+                                        </button>
+
+                                        {[...Array(totalPages)].map(
+                                            (_, index) => {
+                                                const page = index + 1;
+
+                                                return (
+                                                    <button
+                                                        key={page}
+                                                        onClick={() =>
+                                                            setCurrentPage(page)
+                                                        }
+                                                        className={`rounded-xl px-4 py-2 text-xs transition ${
+                                                            currentPage === page
+                                                                ? 'bg-blue-600 text-white'
+                                                                : 'border border-slate-200 bg-white text-slate-600'
+                                                        }`}
+                                                    >
+                                                        {page}
+                                                    </button>
+                                                );
+                                            }
+                                        )}
+
+                                        <button
+                                            disabled={
+                                                currentPage === totalPages
+                                            }
+                                            onClick={() =>
+                                                setCurrentPage((prev) => prev + 1)
+                                            }
+                                            className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-xs text-slate-600 transition disabled:opacity-50"
+                                        >
+                                            Next
+                                        </button>
+                                    </div>
+                                )}
+                            </>
+                        )}
+                    </>
+                )}
             </div>
         </div>
     );
