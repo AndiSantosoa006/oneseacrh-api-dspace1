@@ -27,4 +27,9 @@ Route::get('/api/collections/{uuid}/items', [
     'collectionItems'
 ]);
 
+Route::get(
+    '/api/collections-counts',
+    [SearchController::class, 'collectionCounts']
+);
+
 require __DIR__ . '/auth.php';
